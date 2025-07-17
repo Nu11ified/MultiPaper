@@ -16,11 +16,47 @@ import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class CallDataStorageHandler {
+    // Configurable parameters
+    private static final int SAVE_DELAY_SECONDS = Integer.getInteger("datastorage.save.delay.seconds", 15);
+    private static final int CACHE_SIZE = Integer.getInteger("datastorage.cache.size", 1000);
+    
+    // Use ConcurrentHashMap for thread safety
     private static Map<String, Object> yaml;
+    
+    // Use ReadWriteLock for better concurrency
+    private static final ReadWriteLock yamlLock = new ReentrantReadWriteLock();
+    
+    // Cache for frequently accessed values
+    private static final Map<String, Object> valueCache = new ConcurrentHashMap<>();
+    
+    // Flag to track if data has been modified and needs saving
+    private static final AtomicBoolean dirty = new AtomicBoolean(false);
+    
+    // Executor for scheduled saves
+    private static final ScheduledExecutorService saveExecutor;
+    
+    // Future for tracking save operations
     private static CompletableFuture<Void> saveFuture;
+    
+    static {
+        // Initialize the save executor with a single daemon thread
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, r -> {
+            Thread thread = new Thread(r, "DataStorage-Save");
+            thread.setDaemon(true);
+            return thread;
+        });
+        executor.setRemoveOnCancelPolicy(true);
+        saveExecutor = executor;
+    }
 
     public static void handle(ServerConnection connection, CallDataStorageMessage message) {
         CompletableFuture.runAsync(() -> {

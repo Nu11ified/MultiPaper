@@ -1,62 +1,84 @@
 package puregero.multipaper.server.util;
 
 /*
- ** 2011 January 5
- **
- ** The author disclaims copyright to this source code.  In place of
- ** a legal notice, here is a blessing:
- **
- **    May you do good and not evil.
- **    May you find forgiveness for yourself and forgive others.
- **    May you share freely, never taking more than you give.
- */
+** 2011 January 5
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+*/
 
 /*
- * 2011 February 16
- *
- * This source code is based on the work of Scaevolus (see notice above).
- * It has been slightly modified by Mojang AB to limit the maximum cache
- * size (relevant to extremely big worlds on Linux systems with limited
- * number of file handles). The region files are postfixed with ".mcr"
- * (Minecraft region file) instead of ".data" to differentiate from the
- * original McRegion files.
- *
- */
+* 2011 February 16
+*
+* This source code is based on the work of Scaevolus (see notice above).
+* It has been slightly modified by Mojang AB to limit the maximum cache
+* size (relevant to extremely big worlds on Linux systems with limited
+* number of file handles). The region files are postfixed with ".mcr"
+* (Minecraft region file) instead of ".data" to differentiate from the
+* original McRegion files.
+*
+*/
 
 // A simple cache and wrapper for efficiently multiple RegionFiles simultaneously.
 
 import java.io.*;
 import java.lang.ref.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class RegionFileCache {
 
     private static final int MAX_CACHE_SIZE = Integer.getInteger("max.regionfile.cache.size", 256);
+    
+    // Use a ReadWriteLock for better concurrency - many reads can happen simultaneously
+    private static final ReadWriteLock cacheLock = new ReentrantReadWriteLock();
+    private static final Lock readLock = cacheLock.readLock();
+    private static final Lock writeLock = cacheLock.writeLock();
 
-    private static final LinkedHashMap<File, Reference<RegionFile>> cache = new LinkedHashMap<>(16, 0.75f, true);
+    // Use a ConcurrentHashMap for the canonical path cache to avoid locking
+    private static final Map<File, File> canonicalPathCache = new ConcurrentHashMap<>();
+    
+    // Use a LinkedHashMap with access order for LRU behavior
+    private static final Map<File, Reference<RegionFile>> cache = new LinkedHashMap<>(16, 0.75f, true);
 
     private RegionFileCache() {
     }
 
-    public static synchronized boolean isRegionFileOpen(File regionDir, int chunkX, int chunkZ) {
-        File file = new File(regionDir, "r." + (chunkX >> 5) + "." + (chunkZ >> 5) + ".mca");
-
+    public static boolean isRegionFileOpen(File regionDir, int chunkX, int chunkZ) {
+        File file = getFileForRegionFile(regionDir, chunkX, chunkZ);
         file = canonical(file);
 
-        Reference<RegionFile> ref = cache.get(file);
-
-        if (ref != null && ref.get() != null) {
-            return true;
+        readLock.lock();
+        try {
+            Reference<RegionFile> ref = cache.get(file);
+            return ref != null && ref.get() != null;
+        } finally {
+            readLock.unlock();
         }
-
-        return false;
     }
 
     private static File canonical(File file) {
+        // First check the cache
+        File cachedPath = canonicalPathCache.get(file);
+        if (cachedPath != null) {
+            return cachedPath;
+        }
+        
         try {
             // Remove any .'s and ..'s
-            return new File(file.getCanonicalPath());
+            File canonicalFile = new File(file.getCanonicalPath());
+            canonicalPathCache.put(file, canonicalFile);
+            return canonicalFile;
         } catch (IOException e) {
             e.printStackTrace();
             return file;
@@ -67,58 +89,106 @@ public class RegionFileCache {
         return new File(regionDir, "r." + (chunkX >> 5) + "." + (chunkZ >> 5) + ".mca");
     }
 
-    public static synchronized RegionFile getRegionFileIfExists(File regionDir, int chunkX, int chunkZ) {
+    public static RegionFile getRegionFileIfExists(File regionDir, int chunkX, int chunkZ) {
         File file = getFileForRegionFile(regionDir, chunkX, chunkZ);
-
         file = canonical(file);
 
-        Reference<RegionFile> ref = cache.get(file);
-
-        if (ref != null && ref.get() != null) {
-            return ref.get();
+        // First try with read lock
+        readLock.lock();
+        try {
+            Reference<RegionFile> ref = cache.get(file);
+            if (ref != null) {
+                RegionFile regionFile = ref.get();
+                if (regionFile != null) {
+                    return regionFile;
+                }
+                // Reference was cleared by GC, remove it from cache
+                writeLock.lock();
+                try {
+                    cache.remove(file);
+                } finally {
+                    writeLock.unlock();
+                }
+            }
+        } finally {
+            readLock.unlock();
         }
 
-        if (file.isFile()) {
-            return getRegionFile(regionDir, chunkX, chunkZ);
-        } else {
+        // Check if file exists without locking
+        if (!Files.exists(file.toPath())) {
             return null;
         }
+        
+        // File exists but not in cache, get it with write lock
+        return getRegionFile(regionDir, chunkX, chunkZ);
     }
 
-    public static synchronized RegionFile getRegionFile(File regionDir, int chunkX, int chunkZ) {
+    public static RegionFile getRegionFile(File regionDir, int chunkX, int chunkZ) {
         File file = getFileForRegionFile(regionDir, chunkX, chunkZ);
-
         file = canonical(file);
 
-        Reference<RegionFile> ref = cache.get(file);
-
-        if (ref != null && ref.get() != null) {
-            return ref.get();
+        // First try with read lock
+        readLock.lock();
+        try {
+            Reference<RegionFile> ref = cache.get(file);
+            if (ref != null) {
+                RegionFile regionFile = ref.get();
+                if (regionFile != null) {
+                    return regionFile;
+                }
+            }
+        } finally {
+            readLock.unlock();
         }
 
-        if (!regionDir.exists()) {
-            regionDir.mkdirs();
-        }
+        // Not in cache or reference was cleared, acquire write lock
+        writeLock.lock();
+        try {
+            // Check again in case another thread added it while we were waiting
+            Reference<RegionFile> ref = cache.get(file);
+            if (ref != null) {
+                RegionFile regionFile = ref.get();
+                if (regionFile != null) {
+                    return regionFile;
+                }
+                // Reference was cleared by GC, remove it from cache
+                cache.remove(file);
+            }
 
-        if (cache.size() >= MAX_CACHE_SIZE) {
-            clearOne();
-        }
+            // Ensure directory exists
+            if (!regionDir.exists()) {
+                regionDir.mkdirs();
+            }
 
-        RegionFile reg = new RegionFile(file);
-        cache.put(file, new SoftReference<>(reg));
-        return reg;
+            // Check cache size and clear if needed
+            if (cache.size() >= MAX_CACHE_SIZE) {
+                clearOne();
+            }
+
+            // Create new RegionFile and add to cache
+            RegionFile reg = new RegionFile(file);
+            cache.put(file, new SoftReference<>(reg));
+            return reg;
+        } finally {
+            writeLock.unlock();
+        }
     }
 
-    private static synchronized void clearOne() {
-        Map.Entry<File, Reference<RegionFile>> clearEntry = cache.entrySet().iterator().next();
-        cache.remove(clearEntry.getKey());
-        try {
-            RegionFile removeFile = clearEntry.getValue().get();
-            if (removeFile != null) {
-                removeFile.close();
+    private static void clearOne() {
+        // Must be called with writeLock held
+        Iterator<Map.Entry<File, Reference<RegionFile>>> it = cache.entrySet().iterator();
+        if (it.hasNext()) {
+            Map.Entry<File, Reference<RegionFile>> clearEntry = it.next();
+            it.remove(); // Use iterator.remove() for better performance
+            
+            try {
+                RegionFile removeFile = clearEntry.getValue().get();
+                if (removeFile != null) {
+                    removeFile.close();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
-        } catch (IOException e) {
-            e.printStackTrace();
         }
     }
 
